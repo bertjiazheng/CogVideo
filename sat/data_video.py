@@ -149,8 +149,10 @@ def pad_last_frame(tensor, num_frames):
     # T, H, W, C
     if len(tensor) < num_frames:
         pad_length = num_frames - len(tensor)
-        pad_frame = torch.zeros([pad_length, *tensor.shape[1:]], dtype=tensor.dtype, device=tensor.device)
-        padded_tensor = torch.cat([tensor, pad_frame], dim=0)
+        # Use the last frame to pad instead of zero
+        last_frame = tensor[-1]
+        pad_tensor = last_frame.unsqueeze(0).expand(pad_length, *tensor.shape[1:])
+        padded_tensor = torch.cat([tensor, pad_tensor], dim=0)
         return padded_tensor
     else:
         return tensor[:num_frames]

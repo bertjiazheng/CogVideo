@@ -1,23 +1,25 @@
 import io
-import os
-import sys
-from functools import partial
 import math
-import torchvision.transforms as TT
-from sgm.webds import MetaDistributedWebDataset
+import os
 import random
+import sys
 from fractions import Fraction
-from typing import Union, Optional, Dict, Any, Tuple
-from torchvision.io.video import av
-import numpy as np
-import torch
-from torchvision.io import _video_opt
-from torchvision.io.video import _check_av_available, _read_from_stream, _align_audio_frames
-from torchvision.transforms.functional import center_crop, resize
-from torchvision.transforms import InterpolationMode
+from functools import partial
+from typing import Any, Dict, Optional, Tuple, Union
+
 import decord
+import numpy as np
+import pandas as pd
+import torch
+import torchvision.transforms as TT
 from decord import VideoReader
+from sgm.webds import MetaDistributedWebDataset
 from torch.utils.data import Dataset
+from torchvision.io import _video_opt
+from torchvision.io.video import (_align_audio_frames, _check_av_available,
+                                  _read_from_stream, av)
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms.functional import center_crop, resize
 
 
 def read_video(
@@ -147,8 +149,8 @@ def pad_last_frame(tensor, num_frames):
     # T, H, W, C
     if len(tensor) < num_frames:
         pad_length = num_frames - len(tensor)
-        pad_tensor = torch.zeros([pad_length, *tensor.shape[1:]], dtype=tensor.dtype, device=tensor.device)
-        padded_tensor = torch.cat([tensor, pad_tensor], dim=0)
+        pad_frame = torch.zeros([pad_length, *tensor.shape[1:]], dtype=tensor.dtype, device=tensor.device)
+        padded_tensor = torch.cat([tensor, pad_frame], dim=0)
         return padded_tensor
     else:
         return tensor[:num_frames]
@@ -355,99 +357,97 @@ class VideoDataset(MetaDistributedWebDataset):
 
 
 class SFTDataset(Dataset):
-    def __init__(self, data_dir, video_size, fps, max_num_frames, skip_frms_num=3):
+    def __init__(self, data_csv, video_size, fps, max_num_frames, skip_frms_num=3):
         """
         skip_frms_num: ignore the first and the last xx frames, avoiding transitions.
         """
         super(SFTDataset, self).__init__()
 
-        self.videos_list = []
-        self.captions_list = []
-        self.num_frames_list = []
-        self.fps_list = []
+        self.video_size = video_size
+        self.fps = fps
+        self.max_num_frames = max_num_frames
+        self.skip_frms_num = skip_frms_num
 
-        decord.bridge.set_bridge("torch")
-        for root, dirnames, filenames in os.walk(data_dir):
-            for filename in filenames:
-                if filename.endswith(".mp4"):
-                    video_path = os.path.join(root, filename)
-                    vr = VideoReader(uri=video_path, height=-1, width=-1)
-                    actual_fps = vr.get_avg_fps()
-                    ori_vlen = len(vr)
-
-                    if ori_vlen / actual_fps * fps > max_num_frames:
-                        num_frames = max_num_frames
-                        start = int(skip_frms_num)
-                        end = int(start + num_frames / fps * actual_fps)
-                        end_safty = min(int(start + num_frames / fps * actual_fps), int(ori_vlen))
-                        indices = np.arange(start, end, (end - start) // num_frames).astype(int)
-                        temp_frms = vr.get_batch(np.arange(start, end_safty))
-                        assert temp_frms is not None
-                        tensor_frms = torch.from_numpy(temp_frms) if type(temp_frms) is not torch.Tensor else temp_frms
-                        tensor_frms = tensor_frms[torch.tensor((indices - start).tolist())]
-                    else:
-                        if ori_vlen > max_num_frames:
-                            num_frames = max_num_frames
-                            start = int(skip_frms_num)
-                            end = int(ori_vlen - skip_frms_num)
-                            indices = np.arange(start, end, (end - start) // num_frames).astype(int)
-                            temp_frms = vr.get_batch(np.arange(start, end))
-                            assert temp_frms is not None
-                            tensor_frms = (
-                                torch.from_numpy(temp_frms) if type(temp_frms) is not torch.Tensor else temp_frms
-                            )
-                            tensor_frms = tensor_frms[torch.tensor((indices - start).tolist())]
-                        else:
-
-                            def nearest_smaller_4k_plus_1(n):
-                                remainder = n % 4
-                                if remainder == 0:
-                                    return n - 3
-                                else:
-                                    return n - remainder + 1
-
-                            start = int(skip_frms_num)
-                            end = int(ori_vlen - skip_frms_num)
-                            num_frames = nearest_smaller_4k_plus_1(
-                                end - start
-                            )  # 3D VAE requires the number of frames to be 4k+1
-                            end = int(start + num_frames)
-                            temp_frms = vr.get_batch(np.arange(start, end))
-                            assert temp_frms is not None
-                            tensor_frms = (
-                                torch.from_numpy(temp_frms) if type(temp_frms) is not torch.Tensor else temp_frms
-                            )
-
-                    tensor_frms = pad_last_frame(
-                        tensor_frms, max_num_frames
-                    )  # the len of indices may be less than num_frames, due to round error
-                    tensor_frms = tensor_frms.permute(0, 3, 1, 2)  # [T, H, W, C] -> [T, C, H, W]
-                    tensor_frms = resize_for_rectangle_crop(tensor_frms, video_size, reshape_mode="center")
-                    tensor_frms = (tensor_frms - 127.5) / 127.5
-                    self.videos_list.append(tensor_frms)
-
-                    # caption
-                    caption_path = os.path.join(root, filename.replace(".mp4", ".txt")).replace("videos", "labels")
-                    if os.path.exists(caption_path):
-                        caption = open(caption_path, "r").read().splitlines()[0]
-                    else:
-                        caption = ""
-                    self.captions_list.append(caption)
-                    self.num_frames_list.append(num_frames)
-                    self.fps_list.append(fps)
+        self.dataframe = pd.read_csv(data_csv)
 
     def __getitem__(self, index):
+
+        decord.bridge.set_bridge("torch")
+
+        video_path = self.dataframe.iloc[index]['video_path']
+        vr = VideoReader(uri=video_path, height=-1, width=-1)
+        actual_fps = vr.get_avg_fps()
+        ori_vlen = len(vr)
+
+        if ori_vlen / actual_fps * self.fps > self.max_num_frames:
+            num_frames = self.max_num_frames
+            start = int(self.skip_frms_num)
+            end = int(start + num_frames / self.fps * actual_fps)
+            end_safty = min(int(start + num_frames / self.fps * actual_fps), int(ori_vlen))
+            step = min(1, (end - start) // num_frames)
+            indices = np.arange(start, end, step).astype(int)
+            temp_frms = vr.get_batch(np.arange(start, end_safty))
+            assert temp_frms is not None
+            tensor_frms = torch.from_numpy(temp_frms) if type(temp_frms) is not torch.Tensor else temp_frms
+            tensor_frms = tensor_frms[torch.tensor((indices - start).tolist())]
+        else:
+            if ori_vlen > self.max_num_frames:
+                num_frames = self.max_num_frames
+                start = int(self.skip_frms_num)
+                end = int(ori_vlen - self.skip_frms_num)
+                step = min(1, (end - start) // num_frames)
+                indices = np.arange(start, end, step).astype(int)
+                temp_frms = vr.get_batch(np.arange(start, end))
+                assert temp_frms is not None
+                tensor_frms = (
+                    torch.from_numpy(temp_frms) if type(temp_frms) is not torch.Tensor else temp_frms
+                )
+                tensor_frms = tensor_frms[torch.tensor((indices - start).tolist())]
+            else:
+
+                def nearest_smaller_4k_plus_1(n):
+                    remainder = n % 4
+                    if remainder == 0:
+                        return n - 3
+                    else:
+                        return n - remainder + 1
+
+                start = int(self.skip_frms_num)
+                end = int(ori_vlen - self.skip_frms_num)
+                num_frames = nearest_smaller_4k_plus_1(
+                    end - start
+                )  # 3D VAE requires the number of frames to be 4k+1
+                end = int(start + num_frames)
+                temp_frms = vr.get_batch(np.arange(start, end))
+                assert temp_frms is not None
+                tensor_frms = (
+                    torch.from_numpy(temp_frms) if type(temp_frms) is not torch.Tensor else temp_frms
+                )
+
+        # the len of indices may be less than num_frames, due to round error
+        tensor_frms = pad_last_frame(
+            tensor_frms, self.max_num_frames
+        )  
+        tensor_frms = tensor_frms.permute(0, 3, 1, 2)  # [T, H, W, C] -> [T, C, H, W]
+        tensor_frms = resize_for_rectangle_crop(tensor_frms, self.video_size, reshape_mode="center")
+        tensor_frms = (tensor_frms - 127.5) / 127.5
+
+        assert tensor_frms.size(0) == self.max_num_frames, f'{video_path}: {tensor_frms.shape}'
+
+        # caption
+        caption = self.dataframe.iloc[index]['caption']
+
         item = {
-            "mp4": self.videos_list[index],
-            "txt": self.captions_list[index],
-            "num_frames": self.num_frames_list[index],
-            "fps": self.fps_list[index],
+            "mp4": tensor_frms,
+            "txt": caption,
+            "num_frames": num_frames,
+            "fps": self.fps,
         }
         return item
 
     def __len__(self):
-        return len(self.fps_list)
+        return len(self.dataframe)
 
     @classmethod
     def create_dataset_function(cls, path, args, **kwargs):
-        return cls(data_dir=path, **kwargs)
+        return cls(data_csv=path, **kwargs)

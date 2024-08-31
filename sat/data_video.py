@@ -364,6 +364,11 @@ class SFTDataset(Dataset):
         skip_frms_num: ignore the first and the last xx frames, avoiding transitions.
         """
         super(SFTDataset, self).__init__()
+        
+        self.video_size = video_size
+        self.fps = fps
+        self.max_num_frames = max_num_frames
+        self.skip_frms_num = skip_frms_num
 
         self.video_size = video_size
         self.fps = fps
